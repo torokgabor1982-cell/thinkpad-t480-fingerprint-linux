@@ -1,0 +1,158 @@
+diff --git a/libfprint/drivers/validity/validity_verify.c b/libfprint/drivers/validity/validity_verify.c
+index 157556a..7dbeb0a 100644
+--- a/libfprint/drivers/validity/validity_verify.c
++++ b/libfprint/drivers/validity/validity_verify.c
+@@ -325,7 +325,37 @@ print_owns_record (FpPrint            *print,
+   gsize record_id_len;
+ 
+   g_object_get (print, "fpi-data", &data, NULL);
+-  if (!data || !g_variant_is_of_type (data, G_VARIANT_TYPE_STRING))
++  if (!data)
++    return FALSE;
++
++  /* Listed legacy prints preserve their raw finger subtype alongside ID. */
++  if (g_variant_is_of_type (data, G_VARIANT_TYPE ("(qay)")))
++    {
++      GVariant *bytes;
++      guint16 subtype;
++      gsize binary_len;
++      g_variant_get (data, "(q@ay)", &subtype, &bytes);
++      const guint8 *binary = g_variant_get_fixed_array (bytes, &binary_len, 1);
++      gboolean owns = binary_len > 0 &&
++                      validity_db_user_get_id (user, &record_id, &record_id_len) &&
++                      binary_len == record_id_len &&
++                      memcmp (binary, record_id, binary_len) == 0;
++      g_variant_unref (bytes);
++      return owns;
++    }
++
++  /* Legacy python-validity identities contain binary Windows SIDs. */
++  if (g_variant_is_of_type (data, G_VARIANT_TYPE ("ay")))
++    {
++      gsize binary_len;
++      const guint8 *binary = g_variant_get_fixed_array (data, &binary_len, 1);
++      return binary_len > 0 &&
++             validity_db_user_get_id (user, &record_id, &record_id_len) &&
++             binary_len == record_id_len &&
++             memcmp (binary, record_id, binary_len) == 0;
++    }
++
++  if (!g_variant_is_of_type (data, G_VARIANT_TYPE_STRING))
+     return FALSE;
+ 
+   print_id = g_variant_get_string (data, &print_id_len);
+@@ -376,7 +406,15 @@ validity_print_matches_record (FpPrint                   *print,
+   if (!print_owns_record (print, user))
+     return FALSE;
+ 
+-  if (validity_finger_to_subtype (fp_print_get_finger (print)) != match->subtype)
++  guint16 print_subtype = validity_finger_to_subtype (fp_print_get_finger (print));
++  g_autoptr(GVariant) print_data = NULL;
++  g_object_get (print, "fpi-data", &print_data, NULL);
++  if (print_data && g_variant_is_of_type (print_data, G_VARIANT_TYPE ("(qay)")))
++    {
++      g_autoptr(GVariant) subtype_value = g_variant_get_child_value (print_data, 0);
++      print_subtype = g_variant_get_uint16 (subtype_value);
++    }
++  if (print_subtype == 0 || print_subtype != match->subtype)
+     return FALSE;
+ 
+   for (guint16 i = 0; i < user->finger_count; i++)
+@@ -1188,20 +1226,35 @@ list_get_user_recv (FpiSsm            *ssm,
+ 
+                 if (validity_db_user_get_id (&user, &id_bytes, &id_len))
+                   {
+-                    g_autofree gchar *id =
+-                      g_strndup ((const gchar *) id_bytes, id_len);
+-                    /* The id comes straight off the device. g_variant_new_string
+-                     * aborts (g_critical) on non-UTF-8 input, so validate first;
+-                     * a print with unset fpi-data simply won't match, which is the
+-                     * right outcome for a garbage record. */
+-                    if (g_utf8_validate (id, -1, NULL))
++                    /* Preserve binary IDs byte-for-byte; native libfprint
++                     * IDs remain strings for enrollment compatibility. */
++                    if (finger < 0 || memchr (id_bytes, 0, id_len) != NULL ||
++                        !g_utf8_validate ((const gchar *) id_bytes, id_len, NULL))
+                       g_object_set (print, "fpi-data",
+-                                    g_variant_new_string (id), NULL);
++                                    g_variant_new ("(q@ay)", user.fingers[i].subtype,
++                                      g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE,
++                                                                 id_bytes, id_len, 1)),
++                                    NULL);
++                    else if (memchr (id_bytes, 0, id_len) == NULL &&
++                        g_utf8_validate ((const gchar *) id_bytes, id_len, NULL))
++                      {
++                        g_autofree gchar *id =
++                          g_strndup ((const gchar *) id_bytes, id_len);
++                        g_object_set (print, "fpi-data",
++                                      g_variant_new_string (id), NULL);
++                      }
+                     else
+-                      fp_warn ("Skipping non-UTF-8 identity in stored print");
++                      g_object_set (print, "fpi-data",
++                                    g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE,
++                                                               id_bytes, id_len, 1),
++                                    NULL);
+                   }
+               }
+ 
++              g_autofree gchar *record_description =
++                g_strdup_printf ("Validity record %u subtype %u", user.dbid,
++                                 user.fingers[i].subtype);
++              fp_print_set_description (print, record_description);
+               g_ptr_array_add (prints_array, print);
+             }
+ 
+diff --git a/tests/test-validity.c b/tests/test-validity.c
+index 3bb5d26..4b36175 100644
+--- a/tests/test-validity.c
++++ b/tests/test-validity.c
+@@ -2768,6 +2768,40 @@ test_match_record_no_correlation (void)
+ }
+ 
+ /* Identify returns the gallery print the match belongs to */
++static void
++test_legacy_binary_subtype_match (void)
++{
++  g_autoptr(FpDevice) device = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++  g_autoptr(FpPrint) print = make_enrolled_print (device, FP_FINGER_UNKNOWN, NULL);
++  const guint16 subtypes[] = { 245, 246 };
++  const guint8 sid[] = { 1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0 };
++  ValidityUser user;
++  ValidityMatchResult match;
++  make_user_record (&user, 9, "placeholder", subtypes, 2);
++  g_free (user.identity);
++  user.identity_len = 8 + sizeof (sid);
++  user.identity = g_malloc0 (user.identity_len);
++  user.identity[0] = 3;
++  user.identity[4] = sizeof (sid);
++  memcpy (user.identity + 8, sid, sizeof (sid));
++  g_object_set (print, "fpi-data",
++                g_variant_new ("(q@ay)", 245,
++                  g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, sid, sizeof (sid), 1)),
++                NULL);
++  make_match (&match, 9, FP_FINGER_UNKNOWN);
++  match.subtype = 245;
++  g_assert_true (validity_print_matches_record (print, &match, &user));
++  match.subtype = 246;
++  g_assert_false (validity_print_matches_record (print, &match, &user));
++  match.subtype = 245;
++  match.user_dbid = 18;
++  g_assert_false (validity_print_matches_record (print, &match, &user));
++  match.user_dbid = 9;
++  user.identity[8] ^= 1;
++  g_assert_false (validity_print_matches_record (print, &match, &user));
++  validity_user_clear (&user);
++}
++
+ static void
+ test_gallery_match_correlates (void)
+ {
+@@ -6923,6 +6957,7 @@ main (int argc, char *argv[])
+                    test_gallery_match_empty);
+   g_test_add_func ("/validity/verify/user_get_id",
+                    test_user_get_id);
++  g_test_add_func ("/validity/verify/legacy_binary_subtype", test_legacy_binary_subtype_match);
+   g_test_add_func ("/validity/verify/match_decide_verify",
+                    test_match_decide_verify);
+   g_test_add_func ("/validity/verify/match_decide_identify",
